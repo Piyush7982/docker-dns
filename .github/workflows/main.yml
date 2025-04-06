@@ -31,7 +31,7 @@ jobs:
           context: .
           push: true
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/blockchaindns:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/blockchaindns:${{ github.sha }}
-          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/blockchaindns:buildcache
-          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/blockchaindns:buildcache,mode=max
+            ${{ secrets.DOCKERHUB_USERNAME }}/blockchaindnsnew:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/blockchaindnsnew:${{ github.sha }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/blockchaindnsnew:buildcache
+          cache-to: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/blockchaindnsnew:buildcache,mode=max
