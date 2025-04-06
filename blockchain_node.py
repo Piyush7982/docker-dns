@@ -7,6 +7,11 @@ import socket
 import sys
 import argparse
 import os
+import uuid
+import base64
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.exceptions import InvalidSignature
 from flask import Flask, request, jsonify
 import requests
 from web3 import Web3
@@ -39,9 +44,34 @@ class BlockchainNode:
         self.pending_transactions = []
         self.dns_records = {}  # Local cache of DNS records
         self.ip_address = get_ip_address()
+        self.transaction_map = {}  # Map transaction_id to transaction
+        self.domain_to_block = (
+            {}
+        )  # Track which block contains the latest update for each domain
+
+        # Keys directory for storing validator keys
+        self.keys_dir = os.path.join(os.getcwd(), "keys")
+        if not os.path.exists(self.keys_dir):
+            os.makedirs(self.keys_dir)
 
         print(f"Node initialized with ID: {self.node_id}")
         print(f"Node IP address: {self.ip_address}")
+
+        # Set up PoA consensus
+        self.validators = {}  # Map validator ID to their public key
+        self.validator_order = []  # Ordered list of validators for round-robin
+        self.current_validator_index = 0  # Track whose turn it is to create a block
+
+        # Generate or load key pair if this is a validator
+        if self.is_validator:
+            self.private_key, self.public_key = self._get_key_pair()
+            self.validators[self.node_id] = self.public_key
+            self.validator_order.append(self.node_id)
+            print(f"Node is running as a validator with ID: {self.node_id}")
+        else:
+            self.private_key = None
+            self.public_key = None
+            print(f"Node is running as a non-validator with ID: {self.node_id}")
 
         # Create genesis block if not provided
         if genesis_block:
@@ -49,10 +79,87 @@ class BlockchainNode:
         else:
             self.create_genesis_block()
 
-        # Set up consensus (Proof of Authority)
-        self.validators = set()
-        if self.is_validator:
-            self.validators.add(self.node_id)
+    def _get_key_pair(self):
+        """Generate or load RSA key pair for the validator"""
+        private_key_path = os.path.join(self.keys_dir, f"{self.node_id}.pem")
+        public_key_path = os.path.join(self.keys_dir, f"{self.node_id}.pub")
+
+        if os.path.exists(private_key_path) and os.path.exists(public_key_path):
+            # Load existing keys
+            with open(private_key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(
+                    f.read(), password=None
+                )
+            with open(public_key_path, "rb") as f:
+                public_key = f.read()
+            print(f"Loaded existing key pair for validator {self.node_id}")
+        else:
+            # Generate new keys
+            private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            public_key = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+
+            # Save keys to files
+            with open(private_key_path, "wb") as f:
+                f.write(
+                    private_key.private_bytes(
+                        encoding=serialization.Encoding.PEM,
+                        format=serialization.PrivateFormat.PKCS8,
+                        encryption_algorithm=serialization.NoEncryption(),
+                    )
+                )
+            with open(public_key_path, "wb") as f:
+                f.write(public_key)
+
+            print(f"Generated new key pair for validator {self.node_id}")
+
+        return private_key, public_key
+
+    def sign_data(self, data):
+        """Sign data with the validator's private key"""
+        if not self.is_validator or not self.private_key:
+            return None
+
+        signature = self.private_key.sign(
+            data.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256(),
+        )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def verify_signature(self, data, signature, validator_id):
+        """Verify a signature using a validator's public key"""
+        if validator_id not in self.validators:
+            print(f"Unknown validator: {validator_id}")
+            return False
+
+        public_key_bytes = self.validators[validator_id]
+        try:
+            public_key = serialization.load_pem_public_key(public_key_bytes)
+
+            # Decode the base64 signature
+            signature_bytes = base64.b64decode(signature)
+
+            public_key.verify(
+                signature_bytes,
+                data.encode("utf-8"),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+            return True
+        except InvalidSignature:
+            print(f"Invalid signature from validator {validator_id}")
+            return False
+        except Exception as e:
+            print(f"Error verifying signature: {e}")
+            return False
 
     def create_genesis_block(self):
         """Creates the genesis block with default DNS entries"""
@@ -86,16 +193,31 @@ class BlockchainNode:
             return True
         return False
 
-    def register_validator(self, validator_id):
-        """Registers a validator node"""
-        self.validators.add(validator_id)
+    def register_validator(self, validator_id, public_key):
+        """Registers a validator node with its public key"""
+        if validator_id in self.validators:
+            print(f"Validator {validator_id} is already registered")
+            return False
+
+        # Add the validator's public key
+        self.validators[validator_id] = public_key
+        self.validator_order.append(validator_id)
         print(f"Registered validator: {validator_id}")
+        return True
 
     def create_transaction(
         self, sender, action, domain_name, ip_address=None, new_owner=None
     ):
         """Creates a new DNS transaction"""
+        # Check if domain already exists for 'register' action
+        if action == "register" and domain_name in self.dns_records:
+            return None, "Domain already registered"
+
+        # Generate a unique transaction ID
+        transaction_id = str(uuid.uuid4())
+
         transaction = {
+            "transaction_id": transaction_id,
             "sender": sender,
             "action": action,  # 'register', 'update', 'transfer', 'renew'
             "domain_name": domain_name,
@@ -104,12 +226,15 @@ class BlockchainNode:
             "timestamp": time.time(),
         }
 
+        # Store in transaction map
+        self.transaction_map[transaction_id] = transaction
+
         self.pending_transactions.append(transaction)
 
         # Broadcast transaction to peers
         self.broadcast_transaction(transaction)
 
-        return transaction
+        return transaction, None
 
     def broadcast_transaction(self, transaction):
         """Broadcasts a transaction to all peers"""
@@ -145,34 +270,57 @@ class BlockchainNode:
 
         return False
 
-    def create_new_block(self, validator, signature):
-        """Creates a new block with pending transactions"""
+    def get_next_validator(self):
+        """Determine which validator's turn it is to create a block using round-robin"""
+        if not self.validator_order:
+            return None
+
+        next_validator = self.validator_order[self.current_validator_index]
+        # Update the index for the next round
+        self.current_validator_index = (self.current_validator_index + 1) % len(
+            self.validator_order
+        )
+
+        return next_validator
+
+    def create_new_block(self):
+        """Creates a new block with pending transactions using PoA"""
         if not self.pending_transactions:
             return None
 
+        # Check if it's this node's turn to validate
+        current_validator = self.get_next_validator()
+        if current_validator != self.node_id:
+            print(
+                f"Not this node's turn to create a block. Current validator: {current_validator}"
+            )
+            return None
+
+        # Create the block
         previous_block = self.chain[-1]
         new_block = {
             "index": len(self.chain),
             "timestamp": time.time(),
             "transactions": self.pending_transactions.copy(),
             "previous_hash": previous_block["hash"],
-            "validator": validator,
-            "signature": signature,
+            "validator": self.node_id,
         }
+
+        # Create a string representation for signing
+        block_string = json.dumps(
+            {k: v for k, v in new_block.items() if k != "signature"}, sort_keys=True
+        )
+
+        # Sign the block
+        new_block["signature"] = self.sign_data(block_string)
 
         # Add hash to the new block
         new_block["hash"] = self.hash_block(new_block)
 
-        # Apply transactions to DNS records
-        for transaction in new_block["transactions"]:
-            self.apply_transaction(transaction)
-
-        # Clear pending transactions
-        self.pending_transactions = []
-
+        print(f"Created new block {new_block['index']} as validator {self.node_id}")
         return new_block
 
-    def apply_transaction(self, transaction):
+    def apply_transaction(self, transaction, block_index=None):
         """Applies a transaction to the local DNS records"""
         action = transaction.get("action")
         domain_name = transaction.get("domain_name")
@@ -184,16 +332,46 @@ class BlockchainNode:
                 "registered_at": transaction.get("timestamp"),
                 "expires_at": transaction.get("timestamp")
                 + 31536000,  # 1 year in seconds
+                "last_update": transaction.get("timestamp"),
+                "last_transaction_id": transaction.get("transaction_id"),
             }
+
+            # Track which block this domain update is in
+            if block_index is not None:
+                self.domain_to_block[domain_name] = block_index
 
         elif action == "update" and domain_name in self.dns_records:
             self.dns_records[domain_name]["ip_address"] = transaction.get("ip_address")
+            self.dns_records[domain_name]["last_update"] = transaction.get("timestamp")
+            self.dns_records[domain_name]["last_transaction_id"] = transaction.get(
+                "transaction_id"
+            )
+
+            # Track which block this domain update is in
+            if block_index is not None:
+                self.domain_to_block[domain_name] = block_index
 
         elif action == "transfer" and domain_name in self.dns_records:
             self.dns_records[domain_name]["owner"] = transaction.get("new_owner")
+            self.dns_records[domain_name]["last_update"] = transaction.get("timestamp")
+            self.dns_records[domain_name]["last_transaction_id"] = transaction.get(
+                "transaction_id"
+            )
+
+            # Track which block this domain update is in
+            if block_index is not None:
+                self.domain_to_block[domain_name] = block_index
 
         elif action == "renew" and domain_name in self.dns_records:
             self.dns_records[domain_name]["expires_at"] += 31536000  # Extend by 1 year
+            self.dns_records[domain_name]["last_update"] = transaction.get("timestamp")
+            self.dns_records[domain_name]["last_transaction_id"] = transaction.get(
+                "transaction_id"
+            )
+
+            # Track which block this domain update is in
+            if block_index is not None:
+                self.domain_to_block[domain_name] = block_index
 
     def add_block_to_chain(self, block):
         """Adds a validated block to the blockchain"""
@@ -203,7 +381,11 @@ class BlockchainNode:
 
             # Apply transactions to DNS records
             for transaction in block["transactions"]:
-                self.apply_transaction(transaction)
+                self.apply_transaction(transaction, block["index"])
+
+                # Add to transaction map
+                if "transaction_id" in transaction:
+                    self.transaction_map[transaction["transaction_id"]] = transaction
 
             print(f"Added block {block['index']} to chain")
             return True
@@ -222,21 +404,45 @@ class BlockchainNode:
             "hash",
         ]
         if not all(field in block for field in required_fields):
+            print("Block is missing required fields")
             return False
 
         # Check if the block index is correct
         if block["index"] != len(self.chain):
+            print(
+                f"Block index mismatch: expected {len(self.chain)}, got {block['index']}"
+            )
             return False
 
         # Check if the previous hash matches the hash of the last block in the chain
         if block["previous_hash"] != self.chain[-1]["hash"]:
+            print("Previous hash mismatch")
             return False
 
         # Check if the block hash is valid
         if self.hash_block(block) != block["hash"]:
+            print("Block hash is invalid")
             return False
 
-        # In a real implementation, we would also check the validator's signature here
+        # Skip signature verification for genesis block
+        if block["validator"] == "genesis":
+            return True
+
+        # Check if the validator is authorized
+        if block["validator"] not in self.validators:
+            print(f"Block validator {block['validator']} is not registered")
+            return False
+
+        # Verify the validator's signature
+        block_string = json.dumps(
+            {k: v for k, v in block.items() if k != "signature" and k != "hash"},
+            sort_keys=True,
+        )
+        if not self.verify_signature(
+            block_string, block["signature"], block["validator"]
+        ):
+            print("Block signature verification failed")
+            return False
 
         return True
 
@@ -275,10 +481,16 @@ class BlockchainNode:
     def rebuild_dns_records(self):
         """Rebuilds DNS records from the blockchain"""
         self.dns_records = {}
+        self.domain_to_block = {}
+        self.transaction_map = {}
 
-        for block in self.chain:
+        for i, block in enumerate(self.chain):
             for transaction in block.get("transactions", []):
-                self.apply_transaction(transaction)
+                self.apply_transaction(transaction, i)
+
+                # Rebuild transaction map
+                if "transaction_id" in transaction:
+                    self.transaction_map[transaction["transaction_id"]] = transaction
 
     def validate_chain(self, chain):
         """Validates a blockchain"""
@@ -306,7 +518,47 @@ class BlockchainNode:
         if domain_name in self.dns_records:
             record = self.dns_records[domain_name]
             if record.get("expires_at", 0) > time.time():
-                return record.get("ip_address")
+                # Add block information to the record
+                block_number = self.domain_to_block.get(domain_name)
+                return {
+                    "domain_name": domain_name,
+                    "ip_address": record.get("ip_address"),
+                    "owner": record.get("owner"),
+                    "registered_at": record.get("registered_at"),
+                    "expires_at": record.get("expires_at"),
+                    "last_update": record.get("last_update"),
+                    "block_number": block_number,
+                    "last_transaction_id": record.get("last_transaction_id"),
+                }
+        return None
+
+    def get_transaction_by_id(self, transaction_id):
+        """Get transaction details by transaction ID"""
+        if transaction_id in self.transaction_map:
+            transaction = self.transaction_map[transaction_id]
+
+            # Find which block contains this transaction
+            block_info = None
+            for i, block in enumerate(self.chain):
+                for tx in block["transactions"]:
+                    if tx.get("transaction_id") == transaction_id:
+                        block_info = {
+                            "block_number": i,
+                            "block_hash": block["hash"],
+                            "block_time": block["timestamp"],
+                        }
+                        break
+                if block_info:
+                    break
+
+            return {"transaction": transaction, "block_info": block_info}
+
+        return None
+
+    def get_block_by_number(self, block_number):
+        """Get block details by block number"""
+        if isinstance(block_number, int) and 0 <= block_number < len(self.chain):
+            return self.chain[block_number]
         return None
 
 
@@ -318,10 +570,17 @@ def new_transaction():
     # Check if the transaction is valid
     if blockchain_node.validate_transaction(values):
         blockchain_node.pending_transactions.append(values)
+
+        # Store in transaction map
+        if "transaction_id" in values:
+            blockchain_node.transaction_map[values["transaction_id"]] = values
+
         return (
             jsonify(
                 {
-                    "message": f"Transaction will be added to Block {len(blockchain_node.chain)}"
+                    "message": f"Transaction will be added to Block {len(blockchain_node.chain)}",
+                    "transaction_id": values.get("transaction_id"),
+                    "chain_length": len(blockchain_node.chain),
                 }
             ),
             201,
@@ -335,19 +594,33 @@ def mine():
     if not blockchain_node.is_validator:
         return jsonify({"message": "This node is not a validator"}), 403
 
+    # Check if it's this node's turn to validate
+    current_validator = blockchain_node.get_next_validator()
+    if current_validator != blockchain_node.node_id:
+        return (
+            jsonify(
+                {
+                    "message": f"Not this node's turn to validate. Current validator: {current_validator}"
+                }
+            ),
+            403,
+        )
+
     if not blockchain_node.pending_transactions:
         return jsonify({"message": "No pending transactions to mine"}), 200
 
     # Create a new block
-    new_block = blockchain_node.create_new_block(
-        validator=blockchain_node.node_id, signature="validator_signature"
-    )
+    new_block = blockchain_node.create_new_block()
 
     if not new_block:
         return jsonify({"message": "Failed to create a new block"}), 500
 
     # Add the new block to the chain
-    blockchain_node.chain.append(new_block)
+    if not blockchain_node.add_block_to_chain(new_block):
+        return jsonify({"message": "Failed to add block to the chain"}), 500
+
+    # Clear pending transactions
+    blockchain_node.pending_transactions = []
 
     # Broadcast the new block to all peers
     for peer in blockchain_node.peers:
@@ -361,8 +634,12 @@ def mine():
             {
                 "message": "New block created",
                 "index": new_block["index"],
-                "transactions": new_block["transactions"],
                 "hash": new_block["hash"],
+                "transactions": new_block["transactions"],
+                "timestamp": new_block["timestamp"],
+                "validator": new_block["validator"],
+                "signature": new_block["signature"],
+                "chain_length": len(blockchain_node.chain),
             }
         ),
         200,
@@ -375,7 +652,16 @@ def receive_block():
 
     # Add the block to the chain if it's valid
     if blockchain_node.add_block_to_chain(block):
-        return jsonify({"message": "Block added to the chain"}), 201
+        return (
+            jsonify(
+                {
+                    "message": "Block added to the chain",
+                    "block_number": block["index"],
+                    "chain_length": len(blockchain_node.chain),
+                }
+            ),
+            201,
+        )
 
     return jsonify({"message": "Invalid block"}), 400
 
@@ -411,15 +697,23 @@ def get_peers():
 def register_validator_route():
     values = request.get_json()
     validator_id = values.get("validator_id")
+    public_key = values.get("public_key")
 
-    if validator_id:
-        blockchain_node.register_validator(validator_id)
-        return (
-            jsonify({"message": f"Validator {validator_id} registered successfully"}),
-            201,
-        )
+    if validator_id and public_key:
+        if blockchain_node.register_validator(validator_id, public_key):
+            return (
+                jsonify(
+                    {"message": f"Validator {validator_id} registered successfully"}
+                ),
+                201,
+            )
+        else:
+            return (
+                jsonify({"message": f"Validator {validator_id} already registered"}),
+                200,
+            )
 
-    return jsonify({"message": "Invalid validator ID"}), 400
+    return jsonify({"message": "Invalid validator ID or public key"}), 400
 
 
 @app.route("/dns/register", methods=["POST"])
@@ -430,22 +724,29 @@ def register_domain():
     ip_address = values.get("ip_address")
 
     if sender and domain_name and ip_address:
-        transaction = blockchain_node.create_transaction(
+        transaction, error = blockchain_node.create_transaction(
             sender=sender,
             action="register",
             domain_name=domain_name,
             ip_address=ip_address,
         )
 
-        return (
-            jsonify(
-                {
-                    "message": "Domain registration transaction created",
-                    "transaction": transaction,
-                }
-            ),
-            201,
-        )
+        if transaction:
+            return (
+                jsonify(
+                    {
+                        "message": "Domain registration transaction created",
+                        "transaction": transaction,
+                        "chain_length": len(blockchain_node.chain),
+                        "pending_transactions": len(
+                            blockchain_node.pending_transactions
+                        ),
+                    }
+                ),
+                201,
+            )
+        else:
+            return jsonify({"message": f"Domain registration failed: {error}"}), 400
 
     return jsonify({"message": "Missing values"}), 400
 
@@ -458,22 +759,29 @@ def update_domain():
     ip_address = values.get("ip_address")
 
     if sender and domain_name and ip_address:
-        transaction = blockchain_node.create_transaction(
+        transaction, error = blockchain_node.create_transaction(
             sender=sender,
             action="update",
             domain_name=domain_name,
             ip_address=ip_address,
         )
 
-        return (
-            jsonify(
-                {
-                    "message": "Domain update transaction created",
-                    "transaction": transaction,
-                }
-            ),
-            201,
-        )
+        if transaction:
+            return (
+                jsonify(
+                    {
+                        "message": "Domain update transaction created",
+                        "transaction": transaction,
+                        "chain_length": len(blockchain_node.chain),
+                        "pending_transactions": len(
+                            blockchain_node.pending_transactions
+                        ),
+                    }
+                ),
+                201,
+            )
+        else:
+            return jsonify({"message": f"Domain update failed: {error}"}), 400
 
     return jsonify({"message": "Missing values"}), 400
 
@@ -486,22 +794,29 @@ def transfer_domain():
     new_owner = values.get("new_owner")
 
     if sender and domain_name and new_owner:
-        transaction = blockchain_node.create_transaction(
+        transaction, error = blockchain_node.create_transaction(
             sender=sender,
             action="transfer",
             domain_name=domain_name,
             new_owner=new_owner,
         )
 
-        return (
-            jsonify(
-                {
-                    "message": "Domain transfer transaction created",
-                    "transaction": transaction,
-                }
-            ),
-            201,
-        )
+        if transaction:
+            return (
+                jsonify(
+                    {
+                        "message": "Domain transfer transaction created",
+                        "transaction": transaction,
+                        "chain_length": len(blockchain_node.chain),
+                        "pending_transactions": len(
+                            blockchain_node.pending_transactions
+                        ),
+                    }
+                ),
+                201,
+            )
+        else:
+            return jsonify({"message": f"Domain transfer failed: {error}"}), 400
 
     return jsonify({"message": "Missing values"}), 400
 
@@ -513,40 +828,67 @@ def renew_domain():
     domain_name = values.get("domain_name")
 
     if sender and domain_name:
-        transaction = blockchain_node.create_transaction(
+        transaction, error = blockchain_node.create_transaction(
             sender=sender, action="renew", domain_name=domain_name
         )
 
-        return (
-            jsonify(
-                {
-                    "message": "Domain renewal transaction created",
-                    "transaction": transaction,
-                }
-            ),
-            201,
-        )
+        if transaction:
+            return (
+                jsonify(
+                    {
+                        "message": "Domain renewal transaction created",
+                        "transaction": transaction,
+                        "chain_length": len(blockchain_node.chain),
+                        "pending_transactions": len(
+                            blockchain_node.pending_transactions
+                        ),
+                    }
+                ),
+                201,
+            )
+        else:
+            return jsonify({"message": f"Domain renewal failed: {error}"}), 400
 
     return jsonify({"message": "Missing values"}), 400
 
 
 @app.route("/dns/resolve/<domain_name>", methods=["GET"])
 def resolve_domain(domain_name):
-    ip_address = blockchain_node.resolve_domain(domain_name)
+    result = blockchain_node.resolve_domain(domain_name)
 
-    if ip_address:
-        return jsonify({"domain_name": domain_name, "ip_address": ip_address}), 200
+    if result:
+        return jsonify(result), 200
 
     return jsonify({"message": f"Domain {domain_name} not found or expired"}), 404
 
 
 @app.route("/dns/records", methods=["GET"])
 def get_dns_records():
-    return jsonify({"dns_records": blockchain_node.dns_records}), 200
+    # Enhance the records with block information
+    enhanced_records = {}
+    for domain, record in blockchain_node.dns_records.items():
+        block_number = blockchain_node.domain_to_block.get(domain)
+        enhanced_record = dict(record)
+        enhanced_record["block_number"] = block_number
+        enhanced_records[domain] = enhanced_record
+
+    # Add blockchain info
+    blockchain_info = {
+        "current_block": len(blockchain_node.chain) - 1,
+        "chain_length": len(blockchain_node.chain),
+        "last_update": time.time(),
+    }
+
+    return (
+        jsonify({"dns_records": enhanced_records, "blockchain_info": blockchain_info}),
+        200,
+    )
 
 
 @app.route("/node/status", methods=["GET"])
 def node_status():
+    latest_block = blockchain_node.chain[-1] if blockchain_node.chain else None
+
     return (
         jsonify(
             {
@@ -558,10 +900,34 @@ def node_status():
                 "chain_length": len(blockchain_node.chain),
                 "pending_transactions": len(blockchain_node.pending_transactions),
                 "dns_records_count": len(blockchain_node.dns_records),
+                "last_block_hash": latest_block["hash"] if latest_block else None,
+                "last_block_time": latest_block["timestamp"] if latest_block else None,
+                "validators_count": len(blockchain_node.validators),
+                "validators": list(blockchain_node.validators),
             }
         ),
         200,
     )
+
+
+@app.route("/blocks/<int:block_number>", methods=["GET"])
+def get_block(block_number):
+    block = blockchain_node.get_block_by_number(block_number)
+
+    if block:
+        return jsonify({"block": block}), 200
+
+    return jsonify({"message": f"Block {block_number} not found"}), 404
+
+
+@app.route("/transactions/<transaction_id>", methods=["GET"])
+def get_transaction(transaction_id):
+    result = blockchain_node.get_transaction_by_id(transaction_id)
+
+    if result:
+        return jsonify(result), 200
+
+    return jsonify({"message": f"Transaction {transaction_id} not found"}), 404
 
 
 # Consensus mechanism - run periodically
@@ -575,12 +941,43 @@ def consensus_task():
 def mining_task():
     while True:
         if blockchain_node.is_validator and blockchain_node.pending_transactions:
-            # Use the current node's IP instead of localhost
-            node_url = f"http://{blockchain_node.ip_address}:{args.port}"
-            try:
-                requests.get(f"{node_url}/mine")
-            except requests.exceptions.RequestException as e:
-                print(f"Error mining: {e}")
+            # Check if it's this node's turn to validate
+            current_validator = blockchain_node.get_next_validator()
+            if current_validator == blockchain_node.node_id:
+                print(f"It's our turn to validate as {blockchain_node.node_id}")
+                # Create a new block
+                new_block = blockchain_node.create_new_block()
+
+                if new_block:
+                    # Add the new block to the chain
+                    if blockchain_node.add_block_to_chain(new_block):
+                        print(
+                            f"Successfully added new block {new_block['index']} to the chain"
+                        )
+
+                        # Clear pending transactions that were included in the block
+                        blockchain_node.pending_transactions = []
+
+                        # Broadcast the new block to all peers
+                        for peer in blockchain_node.peers:
+                            try:
+                                response = requests.post(
+                                    f"{peer}/blocks/new", json=new_block
+                                )
+                                print(
+                                    f"Block broadcast to {peer}: {response.status_code}"
+                                )
+                            except requests.exceptions.RequestException as e:
+                                print(f"Error broadcasting to {peer}: {e}")
+                    else:
+                        print("Failed to add the newly created block to the chain")
+                else:
+                    print("Failed to create a new block")
+            else:
+                print(
+                    f"Not our turn to validate. Current validator: {current_validator}"
+                )
+
         time.sleep(5)  # Check for pending transactions every 5 seconds
 
 
