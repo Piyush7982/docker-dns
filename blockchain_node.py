@@ -436,18 +436,44 @@ class BlockchainNode:
             return False
 
         # Check if the block index is correct
-        if block["index"] != len(self.chain):
+        expected_index = len(self.chain)
+        if block["index"] != expected_index:
             print(
-                f"Block index mismatch: expected {len(self.chain)}, got {block['index']}"
+                f"Block index mismatch: expected {expected_index}, got {block['index']}"
             )
-            return False
+            # Only trigger consensus if the incoming block has a higher index
+            if block["index"] > expected_index:
+                print("Triggering consensus due to higher block index...")
+                if self.consensus():
+                    # Recheck index after consensus
+                    if block["index"] == len(self.chain):
+                        return True
+                    else:
+                        print("Block index still mismatched after consensus")
+                        return False
+                else:
+                    print("Consensus failed to resolve index mismatch")
+                    return False
+            else:
+                print("Rejecting block with lower index")
+                return False
 
         # Check if the previous hash matches the hash of the last block in the chain
         if block["previous_hash"] != self.chain[-1]["hash"]:
             print(
                 f"Previous hash mismatch: expected {self.chain[-1]['hash']}, got {block['previous_hash']}"
             )
-            return False
+            # Trigger consensus on hash mismatch as we might be on a different fork
+            if self.consensus():
+                # Recheck hash after consensus
+                if block["previous_hash"] == self.chain[-1]["hash"]:
+                    return True
+                else:
+                    print("Previous hash still mismatched after consensus")
+                    return False
+            else:
+                print("Consensus failed to resolve hash mismatch")
+                return False
 
         # Check if the block hash is valid
         if self.hash_block(block) != block["hash"]:
@@ -480,30 +506,58 @@ class BlockchainNode:
         """Consensus algorithm to resolve conflicts in the blockchain"""
         longest_chain = None
         max_length = len(self.chain)
+        current_time = time.time()
+        consensus_attempts = 0
+        max_attempts = 3
 
-        # Check chains from all peers
-        for peer in self.peers:
-            try:
-                response = requests.get(f"{peer}/chain", timeout=10)
-                if response.status_code == 200:
-                    chain = response.json().get("chain")
-                    length = len(chain)
+        while consensus_attempts < max_attempts:
+            consensus_attempts += 1
+            print(f"Consensus attempt {consensus_attempts}/{max_attempts}")
 
-                    # Check if the chain is longer and valid
-                    if length > max_length and self.validate_chain(chain):
-                        max_length = length
-                        longest_chain = chain
-            except requests.exceptions.RequestException as e:
-                print(f"Error communicating with {peer}: {e}")
-                continue
+            # Check chains from all peers
+            for peer in self.peers:
+                try:
+                    response = requests.get(f"{peer}/chain", timeout=10)
+                    if response.status_code == 200:
+                        chain = response.json().get("chain")
+                        length = len(chain)
 
-        # Replace our chain if a longer valid chain is found
-        if longest_chain:
-            print(f"Replacing chain with longer valid chain of length {max_length}")
-            self.chain = longest_chain
-            self.rebuild_dns_records()
-            return True
+                        # Check if the chain is longer and valid
+                        if length > max_length and self.validate_chain(chain):
+                            # Additional checks for chain validity
+                            if chain[-1]["timestamp"] <= current_time:
+                                # Verify the chain is properly linked
+                                chain_valid = True
+                                for i in range(1, len(chain)):
+                                    if (
+                                        chain[i]["previous_hash"]
+                                        != chain[i - 1]["hash"]
+                                    ):
+                                        chain_valid = False
+                                        break
 
+                                if chain_valid:
+                                    max_length = length
+                                    longest_chain = chain
+                                    print(f"Found valid longer chain from peer {peer}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Failed to fetch chain from peer {peer}: {e}")
+                    continue
+
+            # Replace our chain if a longer valid chain is found
+            if longest_chain:
+                print(f"Replacing chain with longer valid chain of length {max_length}")
+                self.chain = longest_chain
+                self.rebuild_dns_records()
+                # Reset validator index based on new chain
+                self.current_validator_index = 0
+                return True
+
+            # If no valid longer chain found, wait briefly before next attempt
+            if consensus_attempts < max_attempts:
+                time.sleep(2)
+
+        print("Consensus failed: no valid longer chain found")
         return False
 
     def validate_chain(self, chain):

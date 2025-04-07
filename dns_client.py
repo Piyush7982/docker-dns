@@ -213,80 +213,37 @@ class DNSClientShell(cmd.Cmd):
             print(f"Invalid domain name format: {domain_name}")
             return
 
-        # Normalize domain name for consistent lookups
-        normalized_domain = self._normalize_domain(domain_name)
+        # Normalize domain name
+        domain_name = self._normalize_domain(domain_name)
 
-        # First check if domain exists by trying all nodes
-        domain_exists = False
-        domain_owned = False
-
-        for node in self.blockchain_nodes:
-            try:
-                # First try the direct resolve endpoint
-                response = requests.get(
-                    f"{node}/dns/resolve/{normalized_domain}", timeout=10
-                )
-
-                if response.status_code == 200:
-                    domain_exists = True
-                    record = response.json()
-                    if record.get("owner") == self.client_id:
-                        domain_owned = True
-                        break
-
-                # If that fails, check all records
-                records_response = requests.get(f"{node}/dns/records", timeout=10)
-                if records_response.status_code == 200:
-                    records = records_response.json().get("dns_records", {})
-
-                    for record_domain, record in records.items():
-                        if self._normalize_domain(record_domain) == normalized_domain:
-                            domain_exists = True
-                            if record.get("owner") == self.client_id:
-                                domain_owned = True
-                                break
-
-                    if domain_owned:
-                        break
-            except:
-                continue
-
-        if not domain_exists:
-            print(
-                f"Domain {domain_name} does not exist. Cannot transfer non-existent domain."
-            )
+        # Check domain existence and ownership
+        if not self._check_domain_exists(domain_name):
+            print(f"Domain {domain_name} does not exist.")
             return
 
-        if not domain_owned:
-            print(
-                f"You don't own the domain {domain_name}. Only the owner can transfer it."
-            )
+        if not self._check_domain_ownership(domain_name):
+            print(f"You don't own the domain {domain_name}.")
             return
 
-        # Validate new owner ID format (simple check)
+        # Validate new owner ID
         if not new_owner or len(new_owner) < 3:
-            print(f"Invalid new owner ID: {new_owner}")
-            print("Owner ID should be at least 3 characters long.")
+            print("Invalid new owner ID. Must be at least 3 characters long.")
             return
 
-        # Check for special cases
         if new_owner == self.client_id:
-            print("You are already the owner of this domain. Transfer cancelled.")
+            print("You already own this domain.")
             return
 
-        # Double-check with important warning
-        print("\n⚠️ IMPORTANT: Domain transfers are permanent and cannot be reversed!")
-        print(f"You are about to transfer '{domain_name}' to user '{new_owner}'.")
-
-        # Confirm transfer with simple verification
-        confirm = input("Are you sure you want to transfer this domain? (yes/no): ")
-        if confirm.lower() not in ["yes", "y"]:
+        # Double confirmation for transfer
+        print("\n⚠️ WARNING: Domain transfers are permanent!")
+        print(f"You are transferring '{domain_name}' to '{new_owner}'")
+        confirm = input("Type 'yes' to confirm: ")
+        if confirm.lower() != "yes":
             print("Transfer cancelled.")
             return
 
-        # Send transfer request to all nodes until one succeeds
+        # Attempt transfer on all nodes until success
         success = False
-
         for node in self.blockchain_nodes:
             try:
                 response = requests.post(
@@ -296,30 +253,29 @@ class DNSClientShell(cmd.Cmd):
                         "domain_name": domain_name,
                         "new_owner": new_owner,
                     },
-                    timeout=15,
+                    timeout=10,
                 )
 
                 if response.status_code == 201:
-                    success = True
                     transaction = response.json().get("transaction", {})
-
-                    print(f"\n✅ Domain {domain_name} transfer initiated")
+                    print(f"\n✅ Transfer initiated for {domain_name}")
                     print(f"Transaction ID: {transaction.get('transaction_id')}")
-                    print(f"The transfer will be processed in the next block.")
+                    print("Please wait for the transfer to be confirmed...")
 
-                    # Clear from cache since we no longer own it
-                    if domain_name in self.cached_domains:
-                        del self.cached_domains[domain_name]
+                    # Wait for confirmation
+                    time.sleep(5)
+                    if self._check_domain_ownership(domain_name):
+                        print("Transfer pending confirmation...")
+                    else:
+                        print("Transfer completed successfully!")
 
+                    success = True
                     break
-            except:
+            except requests.exceptions.RequestException as e:
                 continue
 
         if not success:
-            print(
-                "Failed to transfer domain. Please check your connection and try again."
-            )
-            print("If the problem persists, the blockchain nodes may be unavailable.")
+            print("Failed to transfer domain. Please try again later.")
 
     def do_renew(self, arg):
         """Renew a domain's registration: renew <domain_name>"""
@@ -1629,6 +1585,56 @@ class DNSClientShell(cmd.Cmd):
         """Print debug message if verbose mode is enabled"""
         if self.verbose:
             print(f"DEBUG: {message}")
+
+    # Hide specified commands from help
+    def get_names(self):
+        names = super().get_names()
+        return [
+            n
+            for n in names
+            if n not in ["do_update", "do_list_nodes", "do_verbose", "do_my_domains"]
+        ]
+
+    def _update_domain(self, domain_name, ip_address):
+        """Internal method to update domain IP address"""
+        if not self._check_domain_exists(domain_name):
+            print(f"Domain {domain_name} does not exist.")
+            return False
+
+        if not self._check_domain_ownership(domain_name):
+            print(f"You don't own the domain {domain_name}.")
+            return False
+
+        # Validate IP address
+        if not self._validate_ip_address(ip_address):
+            print(f"Invalid IP address: {ip_address}")
+            return False
+
+        # Try update on all nodes until success
+        success = False
+        for node in self.blockchain_nodes:
+            try:
+                response = requests.post(
+                    f"{node}/dns/update",
+                    json={
+                        "sender": self.client_id,
+                        "domain_name": domain_name,
+                        "ip_address": ip_address,
+                    },
+                    timeout=10,
+                )
+
+                if response.status_code == 201:
+                    transaction = response.json().get("transaction", {})
+                    print(f"\n✅ Update initiated for {domain_name}")
+                    print(f"New IP: {ip_address}")
+                    print(f"Transaction ID: {transaction.get('transaction_id')}")
+                    success = True
+                    break
+            except requests.exceptions.RequestException:
+                continue
+
+        return success
 
 
 def main():
