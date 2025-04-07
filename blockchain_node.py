@@ -444,7 +444,9 @@ class BlockchainNode:
 
         # Check if the previous hash matches the hash of the last block in the chain
         if block["previous_hash"] != self.chain[-1]["hash"]:
-            print("Previous hash mismatch")
+            print(
+                f"Previous hash mismatch: expected {self.chain[-1]['hash']}, got {block['previous_hash']}"
+            )
             return False
 
         # Check if the block hash is valid
@@ -482,7 +484,7 @@ class BlockchainNode:
         # Check chains from all peers
         for peer in self.peers:
             try:
-                response = requests.get(f"{peer}/chain")
+                response = requests.get(f"{peer}/chain", timeout=10)
                 if response.status_code == 200:
                     chain = response.json().get("chain")
                     length = len(chain)
@@ -493,18 +495,62 @@ class BlockchainNode:
                         longest_chain = chain
             except requests.exceptions.RequestException as e:
                 print(f"Error communicating with {peer}: {e}")
+                continue
 
         # Replace our chain if a longer valid chain is found
         if longest_chain:
+            print(f"Replacing chain with longer valid chain of length {max_length}")
             self.chain = longest_chain
-
-            # Rebuild DNS records from the new chain
             self.rebuild_dns_records()
-
-            print(f"Replaced chain with a longer valid chain of length {max_length}")
             return True
 
         return False
+
+    def validate_chain(self, chain):
+        """Validates a blockchain"""
+        if not chain:
+            return False
+
+        # Check genesis block
+        if chain[0]["index"] != 0 or chain[0]["previous_hash"] != "0":
+            return False
+
+        # Check each block in the chain
+        for i in range(1, len(chain)):
+            current_block = chain[i]
+            previous_block = chain[i - 1]
+
+            # Check block index
+            if current_block["index"] != i:
+                return False
+
+            # Check previous hash
+            if current_block["previous_hash"] != previous_block["hash"]:
+                return False
+
+            # Check block hash
+            if self.hash_block(current_block) != current_block["hash"]:
+                return False
+
+            # Skip signature verification for genesis block
+            if current_block["validator"] == "genesis":
+                continue
+
+            # Verify validator signature
+            block_string = json.dumps(
+                {
+                    k: v
+                    for k, v in current_block.items()
+                    if k != "signature" and k != "hash"
+                },
+                sort_keys=True,
+            )
+            if not self.verify_signature(
+                block_string, current_block["signature"], current_block["validator"]
+            ):
+                return False
+
+        return True
 
     def rebuild_dns_records(self):
         """Rebuilds DNS records from the blockchain"""
@@ -519,27 +565,6 @@ class BlockchainNode:
                 # Rebuild transaction map
                 if "transaction_id" in transaction:
                     self.transaction_map[transaction["transaction_id"]] = transaction
-
-    def validate_chain(self, chain):
-        """Validates a blockchain"""
-        last_block = chain[0]
-        current_index = 1
-
-        while current_index < len(chain):
-            block = chain[current_index]
-
-            # Check if the hash of the block is correct
-            if block["previous_hash"] != self.hash_block(last_block):
-                return False
-
-            # Check if the block hash is valid
-            if self.hash_block(block) != block["hash"]:
-                return False
-
-            last_block = block
-            current_index += 1
-
-        return True
 
     def resolve_domain(self, domain_name):
         """Resolves a domain name to an IP address"""
