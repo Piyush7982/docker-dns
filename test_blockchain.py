@@ -6,19 +6,35 @@ import random
 import json
 
 
-def register_domain(node_url, client_id, domain, ip_address):
+def register_domain(node_url, client_id, domain, ip_address=None):
     """Register a domain on the blockchain"""
     try:
+        # IP address is now optional as server detects it automatically
+        # If provided, it will be ignored by the server
+        transaction = {"sender": client_id, "domain_name": domain}
+
+        # Include IP in message for backwards compatibility
+        # but it will be ignored by the updated server
+        if ip_address:
+            print(
+                f"Note: IP address {ip_address} provided but will be ignored as server auto-detects client IP"
+            )
+            transaction["ip_address"] = (
+                ip_address  # For backwards compatibility with older servers
+            )
+
         response = requests.post(
             f"{node_url}/dns/register",
-            json={"sender": client_id, "domain_name": domain, "ip_address": ip_address},
+            json=transaction,
         )
 
         if response.status_code == 201:
-            print(f"✅ Domain {domain} registered with IP {ip_address}")
-            print(
-                f"Transaction ID: {response.json().get('transaction', {}).get('transaction_id')}"
-            )
+            transaction_data = response.json().get("transaction", {})
+            detected_ip = transaction_data.get("ip_address")
+            print(f"✅ Domain {domain} registered")
+            if detected_ip:
+                print(f"Server detected IP: {detected_ip}")
+            print(f"Transaction ID: {transaction_data.get('transaction_id')}")
             return True
         else:
             print(f"❌ Failed to register domain: {response.json().get('message')}")
@@ -91,8 +107,8 @@ def test_blockchain(node_url, num_domains=3):
     domains = []
     for i in range(num_domains):
         domain = f"test{i}.com"
-        ip = f"192.168.1.{random.randint(10, 250)}"
-        if register_domain(node_url, client_id, domain, ip):
+        # No need to provide IP address as server will detect it
+        if register_domain(node_url, client_id, domain):
             domains.append(domain)
 
     if not domains:

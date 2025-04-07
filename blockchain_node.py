@@ -749,14 +749,27 @@ def register_domain():
     values = request.get_json()
     sender = values.get("sender")
     domain_name = values.get("domain_name")
-    ip_address = values.get("ip_address")
 
-    if sender and domain_name and ip_address:
+    # Extract client IP address from the request instead of trusting the provided IP
+    # Get client IP address - handle reverse proxies by checking X-Forwarded-For first
+    client_ip = request.remote_addr
+    if request.headers.get("X-Forwarded-For"):
+        client_ip = request.headers.get("X-Forwarded-For").split(",")[0].strip()
+
+    print(f"Domain registration request from IP: {client_ip} for domain: {domain_name}")
+
+    # Validate the extracted IP address
+    if not client_ip or client_ip == "127.0.0.1" or client_ip == "localhost":
+        # For local testing, use the node's detected IP if client is on localhost
+        client_ip = blockchain_node.ip_address
+        print(f"Client on localhost, using node IP: {client_ip}")
+
+    if sender and domain_name:
         transaction, error = blockchain_node.create_transaction(
             sender=sender,
             action="register",
             domain_name=domain_name,
-            ip_address=ip_address,
+            ip_address=client_ip,  # Use the extracted IP instead of client-provided IP
         )
 
         if transaction:
@@ -776,7 +789,7 @@ def register_domain():
         else:
             return jsonify({"message": f"Domain registration failed: {error}"}), 400
 
-    return jsonify({"message": "Missing values"}), 400
+    return jsonify({"message": "Missing values (sender or domain_name)"}), 400
 
 
 @app.route("/dns/update", methods=["POST"])

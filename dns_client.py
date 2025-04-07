@@ -37,7 +37,7 @@ class DNSClientShell(cmd.Cmd):
         print(f"Connected to blockchain nodes: {', '.join(self.blockchain_nodes)}")
 
     def do_register(self, arg):
-        """Register a new domain name: register <domain_name>"""
+        """Register a new domain: register <domain_name>"""
         domain_name = arg.strip()
         if not domain_name:
             print("Usage: register <domain_name>")
@@ -61,88 +61,55 @@ class DNSClientShell(cmd.Cmd):
             self._suggest_similar_domains(domain_name)
             return
 
-        # Get client's IP address from the request
-        try:
-            # First try to get the IP from the request
-            response = requests.get("https://api.ipify.org?format=json", timeout=5)
-            if response.status_code == 200:
-                ip_address = response.json()["ip"]
-                print(f"Detected your IP address: {ip_address}")
-            else:
-                print("Warning: Could not automatically detect your IP address")
-                return
-        except requests.exceptions.RequestException as e:
-            print(f"Error detecting IP address: {e}")
-            return
+        # No longer need to get the client's IP address as the server will detect it automatically
+        print("Registering domain with your current IP address...")
+        print("The blockchain node will automatically detect your IP address.")
 
-        # Validate IP address
-        if not self._validate_ip_address(ip_address):
-            print(f"Invalid IP address detected: {ip_address}")
-            return
-
-        # Verify IP is in the expected network range
-        if not self._is_ip_in_valid_range(ip_address):
-            print(
-                f"Warning: Your IP address {ip_address} may not be in the expected network range."
-            )
-            print(
-                "This could happen if you're not connected to the same network as the blockchain nodes."
-            )
-            print("The domain may not be properly resolvable on the network.")
-            confirm = input("Do you want to continue anyway? (y/n): ")
-            if confirm.lower() not in ["y", "yes"]:
-                return
-
-        # Send registration request to a random node
+        # Get a random blockchain node
         node = self._get_random_node()
         if not node:
             print("No blockchain nodes available.")
             return
 
         try:
+            # Create a registration transaction - no need to include IP address
+            transaction = {
+                "sender": self.client_id,
+                "domain_name": domain_name,
+                # IP address is now determined by the server
+            }
+
+            # Send the registration request
             response = requests.post(
-                f"{node}/dns/register",
-                json={
-                    "sender": self.client_id,
-                    "domain_name": domain_name,
-                    "ip_address": ip_address,
-                },
-                timeout=10,
+                f"{node}/dns/register", json=transaction, timeout=10
             )
 
             if response.status_code == 201:
-                json_response = response.json()
-                self.last_transaction = json_response.get("transaction")
+                result = response.json()
+                transaction_data = result.get("transaction", {})
+
+                print(f"✅ Domain {domain_name} registered successfully!")
+                print(f"Transaction ID: {transaction_data.get('transaction_id')}")
+
+                # Show the IP address that was detected and used by the server
+                server_ip = transaction_data.get("ip_address")
+                if server_ip:
+                    print(f"Server detected your IP as: {server_ip}")
+                    # Update local cache
+                    self._update_cache(domain_name, server_ip)
 
                 print(
-                    f"Domain {domain_name} registered successfully with IP {ip_address}"
+                    "Note: It may take some time for the transaction to be mined and confirmed."
                 )
-
-                # Display blockchain information
-                self._print_blockchain_info(json_response)
-
-                # Cache the result
-                self._update_cache(domain_name, ip_address)
-            elif response.status_code == 400:
-                # Check specific error cases
-                message = response.json().get("message", "")
-                if "already registered" in message.lower():
-                    print(
-                        f"Domain {domain_name} is already registered on the blockchain."
-                    )
-                else:
-                    print(f"Failed to register domain: {message}")
+                return
             else:
-                print(
-                    f"Failed to register domain: {response.json().get('message', 'Unknown error')}"
-                )
+                print(f"❌ Failed to register domain: {response.json().get('message')}")
+                return
 
         except requests.exceptions.ConnectionError:
             print(f"Connection error: Could not reach blockchain node at {node}")
-            print("Please check your network connection or try another node.")
         except requests.exceptions.Timeout:
             print(f"Connection timed out while reaching {node}")
-            print("The blockchain node might be busy. Please try again later.")
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
         except Exception as e:
@@ -1026,19 +993,13 @@ class DNSClientShell(cmd.Cmd):
 
         # If no IP provided, get the client's current IP
         if not ip_address:
-            try:
-                response = requests.get("https://api.ipify.org?format=json", timeout=5)
-                if response.status_code == 200:
-                    ip_address = response.json()["ip"]
-                    print(f"Looking up domains for your IP address: {ip_address}")
-                else:
-                    print(
-                        "Could not detect your IP address. Please provide an IP address."
-                    )
-                    return
-            except requests.exceptions.RequestException as e:
-                print(f"Error detecting IP address: {e}")
+            ip_address = self._get_local_ip()
+            if not ip_address:
+                print(
+                    "Could not determine your IP address. Please provide an IP address."
+                )
                 return
+            print(f"Looking up domains for your IP address: {ip_address}")
 
         # Validate IP address
         if not self._validate_ip_address(ip_address):
@@ -1113,6 +1074,48 @@ class DNSClientShell(cmd.Cmd):
             print(f"Error connecting to blockchain node: {e}")
         except Exception as e:
             print(f"Unexpected error: {e}")
+
+    def _get_local_ip(self):
+        """Get the local IP address of the client"""
+        try:
+            # Try socket approach first (most reliable method)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Doesn't need to be reachable, just triggers connection setup
+            s.connect(("10.255.255.255", 1))
+            ip_address = s.getsockname()[0]
+            s.close()
+            return ip_address
+        except Exception as e:
+            try:
+                # Try alternate approach using standard socket functions
+                hostname = socket.gethostname()
+                ip_address = socket.gethostbyname(hostname)
+                return ip_address
+            except Exception as e:
+                try:
+                    # Last resort: check if we can connect to a blockchain node
+                    # and see what IP the connection is coming from
+                    node = self._get_random_node()
+                    if node:
+                        # Use connection to node to determine our IP
+                        response = requests.get(f"{node}/node/status", timeout=5)
+                        if response.status_code == 200:
+                            # See if a peer connection reveals our IP
+                            peers = response.json().get("peers", [])
+                            # Extract potential IP addresses from peer URLs
+                            for peer in peers:
+                                if self.client_id in peer:
+                                    # Extract IP from peer URL
+                                    parts = peer.split("/")
+                                    if len(parts) >= 3:
+                                        host_port = parts[2].split(":")
+                                        if len(host_port) >= 1:
+                                            return host_port[0]
+                except:
+                    pass
+
+                # If all else fails, return a localhost address
+                return "127.0.0.1"
 
     def do_verify_transfer(self, arg):
         """Verify domain transfers to ensure ownership: verify_transfer <domain_name>"""
