@@ -37,13 +37,11 @@ class DNSClientShell(cmd.Cmd):
         print(f"Connected to blockchain nodes: {', '.join(self.blockchain_nodes)}")
 
     def do_register(self, arg):
-        """Register a new domain name: register <domain_name> <ip_address>"""
-        args = arg.split()
-        if len(args) != 2:
-            print("Usage: register <domain_name> <ip_address>")
+        """Register a new domain name: register <domain_name>"""
+        domain_name = arg.strip()
+        if not domain_name:
+            print("Usage: register <domain_name>")
             return
-
-        domain_name, ip_address = args
 
         # Validate domain name format
         if not self._validate_domain_name(domain_name):
@@ -51,24 +49,47 @@ class DNSClientShell(cmd.Cmd):
             print("Domain names must follow standard format (e.g., example.com)")
             return
 
-        # Check if domain already exists in cache
+        # Check if domain already exists in cache or on blockchain
         if domain_name in self.cached_domains:
             print(f"Domain {domain_name} already exists in your local cache.")
             print(f"If you believe this is an error, use 'clear_cache' and try again.")
             return
 
-        # Validate IP address
-        if not self._validate_ip_address(ip_address):
-            print(f"Invalid IP address: {ip_address}")
-            print("Please provide a valid IPv4 address.")
+        # Check if domain already exists on the blockchain
+        if self._check_domain_exists(domain_name):
+            print(f"Domain {domain_name} is already registered on the blockchain.")
+            self._suggest_similar_domains(domain_name)
             return
 
-        # Check if IP is within valid network range
+        # Get client's IP address from the request
+        try:
+            # First try to get the IP from the request
+            response = requests.get("https://api.ipify.org?format=json", timeout=5)
+            if response.status_code == 200:
+                ip_address = response.json()["ip"]
+                print(f"Detected your IP address: {ip_address}")
+            else:
+                print("Warning: Could not automatically detect your IP address")
+                return
+        except requests.exceptions.RequestException as e:
+            print(f"Error detecting IP address: {e}")
+            return
+
+        # Validate IP address
+        if not self._validate_ip_address(ip_address):
+            print(f"Invalid IP address detected: {ip_address}")
+            return
+
+        # Verify IP is in the expected network range
         if not self._is_ip_in_valid_range(ip_address):
             print(
-                f"Warning: IP address {ip_address} may not be in the expected network range."
+                f"Warning: Your IP address {ip_address} may not be in the expected network range."
             )
-            confirm = input("Continue with registration? (y/n): ")
+            print(
+                "This could happen if you're not connected to the same network as the blockchain nodes."
+            )
+            print("The domain may not be properly resolvable on the network.")
+            confirm = input("Do you want to continue anyway? (y/n): ")
             if confirm.lower() not in ["y", "yes"]:
                 return
 
@@ -86,6 +107,7 @@ class DNSClientShell(cmd.Cmd):
                     "domain_name": domain_name,
                     "ip_address": ip_address,
                 },
+                timeout=10,
             )
 
             if response.status_code == 201:
@@ -111,10 +133,20 @@ class DNSClientShell(cmd.Cmd):
                 else:
                     print(f"Failed to register domain: {message}")
             else:
-                print(f"Failed to register domain: {response.json().get('message')}")
+                print(
+                    f"Failed to register domain: {response.json().get('message', 'Unknown error')}"
+                )
 
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+            print("Please check your network connection or try another node.")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+            print("The blockchain node might be busy. Please try again later.")
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
 
     def do_update(self, arg):
         """Update an existing domain's IP address: update <domain_name> <new_ip_address>"""
@@ -134,6 +166,16 @@ class DNSClientShell(cmd.Cmd):
         if not self._validate_ip_address(ip_address):
             print(f"Invalid IP address: {ip_address}")
             return
+
+        # Check if IP is in valid network range
+        if not self._is_ip_in_valid_range(ip_address):
+            print(
+                f"Warning: IP address {ip_address} is not in the expected network range."
+            )
+            print("This may cause the domain to be unreachable.")
+            confirm = input("Continue with update? (y/n): ")
+            if confirm.lower() not in ["y", "yes"]:
+                return
 
         # First check if domain exists
         if not self._check_domain_exists(domain_name):
@@ -163,6 +205,7 @@ class DNSClientShell(cmd.Cmd):
                     "domain_name": domain_name,
                     "ip_address": ip_address,
                 },
+                timeout=10,
             )
 
             if response.status_code == 201:
@@ -178,10 +221,20 @@ class DNSClientShell(cmd.Cmd):
                 if domain_name in self.cached_domains:
                     self._update_cache(domain_name, ip_address)
             else:
-                print(f"Failed to update domain: {response.json().get('message')}")
+                print(
+                    f"Failed to update domain: {response.json().get('message', 'Unknown error')}"
+                )
 
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+            print("Please check your network connection or try another node.")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+            print("The blockchain node might be busy. Please try again later.")
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
 
     def do_transfer(self, arg):
         """Transfer domain ownership: transfer <domain_name> <new_owner_id>"""
@@ -247,6 +300,7 @@ class DNSClientShell(cmd.Cmd):
                     "domain_name": domain_name,
                     "new_owner": new_owner,
                 },
+                timeout=10,
             )
 
             if response.status_code == 201:
@@ -270,10 +324,20 @@ class DNSClientShell(cmd.Cmd):
                     if domain_name in self.cache_expiry:
                         del self.cache_expiry[domain_name]
             else:
-                print(f"Failed to transfer domain: {response.json().get('message')}")
+                print(
+                    f"Failed to transfer domain: {response.json().get('message', 'Unknown error')}"
+                )
 
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+            print("Please check your network connection or try another node.")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+            print("The blockchain node might be busy. Please try again later.")
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
 
     def do_renew(self, arg):
         """Renew a domain's registration: renew <domain_name>"""
@@ -362,7 +426,7 @@ class DNSClientShell(cmd.Cmd):
             return
 
         try:
-            response = requests.get(f"{node}/dns/resolve/{domain_name}")
+            response = requests.get(f"{node}/dns/resolve/{domain_name}", timeout=10)
 
             if response.status_code == 200:
                 json_response = response.json()
@@ -406,10 +470,20 @@ class DNSClientShell(cmd.Cmd):
                 # Suggest similar domains if available
                 self._suggest_similar_domains(domain_name)
             else:
-                print(f"Failed to resolve domain: {response.json().get('message')}")
+                print(
+                    f"Failed to resolve domain: {response.json().get('message', 'Unknown error')}"
+                )
 
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+            print("Please check your network connection or try another node.")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+            print("The blockchain node might be busy. Please try again later.")
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
 
     def do_list_records(self, arg):
         """List all DNS records in the blockchain"""
@@ -868,12 +942,398 @@ class DNSClientShell(cmd.Cmd):
         except requests.exceptions.RequestException as e:
             print(f"Error connecting to blockchain node: {e}")
 
+    def do_my_domains(self, arg):
+        """List all domains associated with your client ID"""
+        node = self._get_random_node()
+        if not node:
+            print("No blockchain nodes available.")
+            return
+
+        try:
+            response = requests.get(f"{node}/dns/records", timeout=10)
+
+            if response.status_code == 200:
+                records = response.json().get("dns_records", {})
+
+                own_domains = {
+                    domain: record
+                    for domain, record in records.items()
+                    if record.get("owner") == self.client_id
+                }
+
+                if not own_domains:
+                    print("You don't own any domains.")
+                    return
+
+                # Display domains in a table
+                print(f"\nYou own {len(own_domains)} domains:")
+
+                table_data = []
+                headers = ["Domain", "IP Address", "Registered", "Expires", "Block #"]
+
+                for domain, record in own_domains.items():
+                    registered = time.ctime(record.get("registered_at", 0))
+                    expires = time.ctime(record.get("expires_at", 0))
+                    remaining = max(
+                        0, int((record.get("expires_at", 0) - time.time()) / 86400)
+                    )
+
+                    table_data.append(
+                        [
+                            domain,
+                            record.get("ip_address", "N/A"),
+                            registered,
+                            f"{expires} ({remaining} days left)",
+                            record.get("block_number", "N/A"),
+                        ]
+                    )
+
+                print(tabulate(table_data, headers=headers, tablefmt="grid"))
+
+                # Show expiring domains
+                expiring_soon = [
+                    (domain, record.get("expires_at", 0))
+                    for domain, record in own_domains.items()
+                    if record.get("expires_at", 0) - time.time() < 30 * 86400  # 30 days
+                ]
+
+                if expiring_soon:
+                    print("\n⚠️ Domains expiring soon:")
+                    for domain, expires_at in sorted(expiring_soon, key=lambda x: x[1]):
+                        days_left = max(0, int((expires_at - time.time()) / 86400))
+                        print(
+                            f"  • {domain}: {days_left} days left (expires {time.ctime(expires_at)})"
+                        )
+                        print(f"    To renew: renew {domain}")
+            else:
+                print(
+                    f"Failed to retrieve DNS records: {response.json().get('message', 'Unknown error')}"
+                )
+
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+
+    def do_lookup_ip(self, arg):
+        """Find domains associated with an IP address: lookup_ip [ip_address]
+        If no IP is provided, it will look up domains for your current IP address."""
+        ip_address = arg.strip()
+
+        # If no IP provided, get the client's current IP
+        if not ip_address:
+            try:
+                response = requests.get("https://api.ipify.org?format=json", timeout=5)
+                if response.status_code == 200:
+                    ip_address = response.json()["ip"]
+                    print(f"Looking up domains for your IP address: {ip_address}")
+                else:
+                    print(
+                        "Could not detect your IP address. Please provide an IP address."
+                    )
+                    return
+            except requests.exceptions.RequestException as e:
+                print(f"Error detecting IP address: {e}")
+                return
+
+        # Validate IP address
+        if not self._validate_ip_address(ip_address):
+            print(f"Invalid IP address format: {ip_address}")
+            return
+
+        # Query the blockchain for domains with this IP
+        node = self._get_random_node()
+        if not node:
+            print("No blockchain nodes available.")
+            return
+
+        try:
+            response = requests.get(f"{node}/dns/records", timeout=10)
+
+            if response.status_code == 200:
+                records = response.json().get("dns_records", {})
+
+                matching_domains = {
+                    domain: record
+                    for domain, record in records.items()
+                    if record.get("ip_address") == ip_address
+                }
+
+                if not matching_domains:
+                    print(f"No domains found with IP address {ip_address}")
+                    return
+
+                # Display the domains in a table
+                print(
+                    f"\n🔍 Found {len(matching_domains)} domains with IP {ip_address}:"
+                )
+
+                table_data = []
+                headers = ["Domain", "Owner", "Registered", "Block #"]
+
+                for domain, record in matching_domains.items():
+                    registered = time.ctime(record.get("registered_at", 0))
+                    is_yours = record.get("owner") == self.client_id
+                    owner = record.get("owner", "Unknown")
+                    if is_yours:
+                        owner = f"{owner} (You)"
+
+                    table_data.append(
+                        [domain, owner, registered, record.get("block_number", "N/A")]
+                    )
+
+                print(tabulate(table_data, headers=headers, tablefmt="grid"))
+
+                # If any domains are owned by the current client, highlight them
+                own_domains = [
+                    domain
+                    for domain, record in matching_domains.items()
+                    if record.get("owner") == self.client_id
+                ]
+
+                if own_domains:
+                    print(
+                        f"\nYou own {len(own_domains)} of these domains: {', '.join(own_domains)}"
+                    )
+
+            else:
+                print(
+                    f"Failed to retrieve DNS records: {response.json().get('message', 'Unknown error')}"
+                )
+
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+
+    def do_verify_transfer(self, arg):
+        """Verify domain transfers to ensure ownership: verify_transfer <domain_name>"""
+        domain_name = arg.strip()
+        if not domain_name:
+            print("Usage: verify_transfer <domain_name>")
+            return
+
+        # Validate domain name format
+        if not self._validate_domain_name(domain_name):
+            print(f"Invalid domain name format: {domain_name}")
+            return
+
+        # Check if domain exists on the blockchain
+        node = self._get_random_node()
+        if not node:
+            print("No blockchain nodes available.")
+            return
+
+        try:
+            # Resolve the domain to get current information
+            response = requests.get(f"{node}/dns/resolve/{domain_name}", timeout=10)
+
+            if response.status_code == 200:
+                record = response.json()
+
+                # Check if the current client is the owner
+                if record.get("owner") == self.client_id:
+                    print(f"✅ Verified: You are the current owner of {domain_name}")
+
+                    # Print additional domain information
+                    print(f"\n📋 Domain Information:")
+                    print(f"IP Address: {record.get('ip_address', 'N/A')}")
+                    if "registered_at" in record:
+                        print(f"Registered: {time.ctime(record.get('registered_at'))}")
+                    if "expires_at" in record:
+                        expires_at = record.get("expires_at")
+                        remaining_days = max(0, int((expires_at - time.time()) / 86400))
+                        print(
+                            f"Expires: {time.ctime(expires_at)} ({remaining_days} days remaining)"
+                        )
+                    if "block_number" in record:
+                        print(f"Stored in block: #{record.get('block_number')}")
+
+                    # Check recent transactions to see transfer history
+                    try:
+                        if "last_transaction_id" in record:
+                            tx_id = record.get("last_transaction_id")
+                            tx_response = requests.get(
+                                f"{node}/transactions/{tx_id}", timeout=5
+                            )
+
+                            if tx_response.status_code == 200:
+                                tx_data = tx_response.json()
+                                transaction = tx_data.get("transaction", {})
+
+                                if transaction.get("action") == "transfer":
+                                    print(f"\n🔄 Recent Transfer Information:")
+                                    print(
+                                        f"Transferred from: {transaction.get('sender')}"
+                                    )
+                                    print(
+                                        f"Transferred to: {transaction.get('new_owner')}"
+                                    )
+                                    print(
+                                        f"Transaction time: {time.ctime(transaction.get('timestamp', 0))}"
+                                    )
+                    except Exception as e:
+                        # Non-critical, can continue without this information
+                        pass
+                else:
+                    previous_owner = record.get("owner", "Unknown")
+                    print(f"❌ You are NOT the current owner of {domain_name}")
+                    print(f"Current owner: {previous_owner}")
+
+                    # Check if this domain was previously owned by this client
+                    try:
+                        if "last_transaction_id" in record:
+                            tx_id = record.get("last_transaction_id")
+                            tx_response = requests.get(
+                                f"{node}/transactions/{tx_id}", timeout=5
+                            )
+
+                            if tx_response.status_code == 200:
+                                tx_data = tx_response.json()
+                                transaction = tx_data.get("transaction", {})
+
+                                if (
+                                    transaction.get("action") == "transfer"
+                                    and transaction.get("sender") == self.client_id
+                                ):
+                                    print(
+                                        f"\n⚠️ This domain was previously owned by you and transferred to {transaction.get('new_owner')}"
+                                    )
+                                    print(
+                                        f"Transferred on: {time.ctime(transaction.get('timestamp', 0))}"
+                                    )
+                    except Exception as e:
+                        # Non-critical, can continue without this information
+                        pass
+
+                    # Provide suggestions
+                    print("\nOptions:")
+                    print(
+                        f"1. Contact the current owner ({previous_owner}) to request a transfer"
+                    )
+                    print(f"2. Register a different domain name")
+                    self._suggest_similar_domains(domain_name)
+
+            elif response.status_code == 404:
+                print(f"Domain {domain_name} is not registered on the blockchain.")
+                print("You can register it with the command:")
+                print(f"  register {domain_name}")
+            else:
+                print(
+                    f"Failed to verify domain: {response.json().get('message', 'Unknown error')}"
+                )
+
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error: Could not reach blockchain node at {node}")
+        except requests.exceptions.Timeout:
+            print(f"Connection timed out while reaching {node}")
+        except requests.exceptions.RequestException as e:
+            print(f"Error connecting to blockchain node: {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+
+    def _is_ip_in_valid_range(self, ip_addr):
+        """Check if IP is in the expected network range and actually reachable"""
+        try:
+            ip = ip_address(ip_addr)
+            # First check if in private address ranges typically used in this network
+            if not (
+                ip.is_private
+                or str(ip).startswith("192.168.")
+                or str(ip).startswith("10.")
+                or str(ip).startswith("172.16.")
+            ):
+                return False
+
+            # Now try to check if the IP is actually on the network by pinging
+            if self._check_ip_pingable(ip_addr):
+                return True
+
+            # If ping fails, try to query a node for network status to see if IP is in list
+            node = self._get_random_node()
+            if node:
+                try:
+                    response = requests.get(f"{node}/peers", timeout=3)
+                    if response.status_code == 200:
+                        peers = response.json().get("peers", [])
+                        for peer in peers:
+                            if ip_addr in peer:
+                                return True
+                except:
+                    pass
+
+            # If we couldn't verify it's online but it's in a valid range, give it benefit of doubt
+            return True
+
+        except ValueError:
+            return False
+
+    def _check_ip_pingable(self, ip_addr):
+        """Check if an IP address is pingable on the network (cross-platform)"""
+        try:
+            # Determine the appropriate ping command based on the OS
+            import platform
+
+            system = platform.system().lower()
+
+            if system == "windows":
+                # Windows ping uses -n for count and -w for timeout in milliseconds
+                ping_cmd = f"ping -n 1 -w 1000 {ip_addr} > nul 2>&1"
+            elif system in ["linux", "darwin"]:  # Linux or MacOS
+                # Linux/MacOS ping uses -c for count and -W for timeout in seconds
+                ping_cmd = f"ping -c 1 -W 1 {ip_addr} > /dev/null 2>&1"
+            else:
+                # Unknown OS, default to network connectivity test without ping
+                try:
+                    socket.create_connection((ip_addr, 80), timeout=1)
+                    return True
+                except:
+                    return False
+
+            response = os.system(ping_cmd)
+            return response == 0
+        except:
+            # If any error occurs during ping, try a direct socket connection
+            try:
+                socket.create_connection((ip_addr, 80), timeout=1)
+                return True
+            except:
+                return False
+
+    def _get_node_status(self, node_url, timeout=3):
+        """Get the status of a blockchain node with timeout"""
+        try:
+            response = requests.get(f"{node_url}/node/status", timeout=timeout)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except:
+            return None
+
     # Helper methods
     def _get_random_node(self):
         """Get a random blockchain node from the connected nodes"""
         if not self.blockchain_nodes:
             return None
-        return random.choice(self.blockchain_nodes)
+
+        # Try nodes in random order until we find one that responds
+        available_nodes = list(self.blockchain_nodes)
+        random.shuffle(available_nodes)
+
+        for node in available_nodes:
+            if self._get_node_status(node, timeout=2):
+                return node
+
+        print("Warning: No responsive blockchain nodes found!")
+        return None
 
     def _validate_domain_name(self, domain_name):
         """Validate domain name format using regex"""
@@ -881,24 +1341,12 @@ class DNSClientShell(cmd.Cmd):
             return False
         return bool(self.DOMAIN_REGEX.match(domain_name))
 
-    def _validate_ip_address(self, ip_address):
+    def _validate_ip_address(self, ip_addr):
         """Validate IP address format"""
         try:
-            return isinstance(ip_address(ip_address), IPv4Address)
-        except ValueError:
-            return False
-
-    def _is_ip_in_valid_range(self, ip_addr):
-        """Check if IP is in the expected network range"""
-        try:
             ip = ip_address(ip_addr)
-            # Check if in private address ranges typically used in GNS3
-            return (
-                ip.is_private
-                or str(ip).startswith("192.168.")
-                or str(ip).startswith("10.")
-                or str(ip).startswith("172.16.")
-            )
+            # Only accept IPv4 addresses for simplicity
+            return isinstance(ip, IPv4Address)
         except ValueError:
             return False
 
@@ -911,35 +1359,112 @@ class DNSClientShell(cmd.Cmd):
         return bool(url_pattern.match(url))
 
     def _check_domain_exists(self, domain_name):
-        """Check if a domain exists in the blockchain"""
+        """Check if a domain exists in the blockchain with improved error handling"""
         node = self._get_random_node()
         if not node:
             print("No blockchain nodes available.")
             return False
 
         try:
-            response = requests.get(f"{node}/dns/resolve/{domain_name}")
+            # Try to get the domain from the blockchain's DNS records endpoint first
+            # This is more efficient as it avoids potential timeouts with resolve endpoint
+            records_response = requests.get(f"{node}/dns/records", timeout=5)
+
+            if records_response.status_code == 200:
+                records = records_response.json().get("dns_records", {})
+                if domain_name in records:
+                    # Check if the domain is expired
+                    record = records[domain_name]
+                    if record.get("expires_at", 0) > time.time():
+                        return True
+                    else:
+                        # Domain exists but is expired
+                        return False
+                else:
+                    # Domain not found in records
+                    return False
+
+            # Fallback to the direct resolve endpoint if records approach fails
+            response = requests.get(f"{node}/dns/resolve/{domain_name}", timeout=5)
             return response.status_code == 200
-        except:
-            print("Error checking domain existence.")
+
+        except requests.exceptions.Timeout:
+            print(f"Timeout checking domain existence: {domain_name}")
+            return False
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error checking domain: {domain_name}")
+            return False
+        except requests.exceptions.RequestException as e:
+            print(f"Error checking domain existence: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error checking domain: {e}")
             return False
 
     def _check_domain_ownership(self, domain_name):
-        """Check if the current client owns a domain"""
+        """Check if the current client owns a domain with improved error handling"""
         node = self._get_random_node()
         if not node:
             print("No blockchain nodes available.")
             return False
 
         try:
-            response = requests.get(f"{node}/dns/records")
-            if response.status_code == 200:
-                records = response.json().get("dns_records", {})
+            # First try the direct resolve endpoint which is faster
+            resolve_response = requests.get(
+                f"{node}/dns/resolve/{domain_name}", timeout=5
+            )
+
+            if resolve_response.status_code == 200:
+                record = resolve_response.json()
+                if record.get("owner") == self.client_id:
+                    # Also check if the domain is expired
+                    if record.get("expires_at", 0) > time.time():
+                        return True
+                    else:
+                        print(
+                            f"Domain {domain_name} has expired. Please renew it first."
+                        )
+                        return False
+                return False
+            elif resolve_response.status_code == 404:
+                # Domain doesn't exist
+                return False
+
+            # Fallback to checking all records if direct resolve fails
+            records_response = requests.get(f"{node}/dns/records", timeout=5)
+
+            if records_response.status_code == 200:
+                records = records_response.json().get("dns_records", {})
                 if domain_name in records:
-                    return records[domain_name].get("owner") == self.client_id
+                    record = records[domain_name]
+                    # Check both ownership and expiration
+                    is_owner = record.get("owner") == self.client_id
+                    is_expired = record.get("expires_at", 0) <= time.time()
+
+                    if is_owner and is_expired:
+                        print(
+                            f"Domain {domain_name} has expired. Please renew it first."
+                        )
+
+                    return is_owner and not is_expired
+                return False
+            else:
+                print(
+                    f"Unexpected response checking domain ownership: {records_response.status_code}"
+                )
+                return False
+
+        except requests.exceptions.Timeout:
+            print(f"Timeout checking domain ownership: {domain_name}")
             return False
-        except:
-            print("Error checking domain ownership.")
+        except requests.exceptions.ConnectionError:
+            print(f"Connection error checking ownership: {domain_name}")
+            return False
+        except requests.exceptions.RequestException as e:
+            print(f"Error checking domain ownership: {e}")
+            return False
+        except Exception as e:
+            print(f"Unexpected error checking ownership: {e}")
             return False
 
     def _update_cache(self, domain_name, ip_address):
@@ -1020,36 +1545,51 @@ class DNSClientShell(cmd.Cmd):
             return
 
         try:
-            response = requests.get(f"{node}/dns/records")
+            response = requests.get(f"{node}/dns/records", timeout=5)
             if response.status_code == 200:
                 records = response.json().get("dns_records", {})
 
                 # Look for similar domains
                 similar_domains = []
                 for existing_domain in records.keys():
-                    existing_parts = existing_domain.split(".")
-                    if len(existing_parts) != 2:
+                    try:
+                        existing_parts = existing_domain.split(".")
+                        if len(existing_parts) != 2:
+                            continue
+
+                        existing_base, existing_tld = existing_parts
+
+                        # Check for similarity
+                        if existing_tld == tld and (
+                            existing_base.startswith(base_name[:3])
+                            or base_name.startswith(existing_base[:3])
+                            or self._levenshtein_distance(base_name, existing_base) <= 2
+                        ):
+                            similar_domains.append(existing_domain)
+                    except Exception as e:
+                        print(f"Error processing domain {existing_domain}: {e}")
                         continue
-
-                    existing_base, existing_tld = existing_parts
-
-                    # Check for similarity
-                    if existing_tld == tld and (
-                        existing_base.startswith(base_name[:3])
-                        or base_name.startswith(existing_base[:3])
-                        or self._levenshtein_distance(base_name, existing_base) <= 2
-                    ):
-                        similar_domains.append(existing_domain)
 
                 # Display similar domains
                 if similar_domains:
                     print("\nSimilar domains that exist:")
                     for i, domain in enumerate(similar_domains[:5], 1):
-                        print(
-                            f"  {i}. {domain} -> {records[domain].get('ip_address', 'N/A')}"
-                        )
-        except:
-            pass
+                        try:
+                            print(
+                                f"  {i}. {domain} -> {records[domain].get('ip_address', 'N/A')}"
+                            )
+                        except Exception as e:
+                            print(f"Error displaying domain {domain}: {e}")
+            else:
+                print(f"Error fetching records: {response.status_code}")
+        except requests.exceptions.Timeout:
+            print("Timeout while fetching records for suggestions")
+        except requests.exceptions.ConnectionError:
+            print("Connection error while fetching records")
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching records for suggestions: {e}")
+        except Exception as e:
+            print(f"Unexpected error suggesting similar domains: {e}")
 
     def _levenshtein_distance(self, s1, s2):
         """Calculate the Levenshtein distance between two strings"""

@@ -16,21 +16,34 @@ from flask import Flask, request, jsonify
 import requests
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
+import signal
 
 app = Flask(__name__)
+
+# Add global flag for shutdown
+shutdown_flag = threading.Event()
+
+
+# Add signal handler
+def signal_handler(signum, frame):
+    print("\nShutting down blockchain node...")
+    shutdown_flag.set()
+    # Give threads time to cleanup
+    time.sleep(2)
+    sys.exit(0)
 
 
 # Get the current node's IP address
 def get_ip_address():
+    """Get the current node's IP address that can be reached externally"""
     try:
-        # This gets the IP that can be reached externally
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
-    except:
-        # Fallback to localhost if no external IP
+    except (socket.error, OSError) as e:
+        print(f"Warning: Could not determine external IP: {e}")
         return "127.0.0.1"
 
 
@@ -186,12 +199,19 @@ class BlockchainNode:
 
     def add_peer(self, peer_address):
         """Adds a peer node to the network"""
-        own_address = f"http://{self.ip_address}:{args.port}"
-        if peer_address not in self.peers and peer_address != own_address:
-            self.peers.add(peer_address)
-            print(f"Added peer: {peer_address}")
-            return True
-        return False
+        try:
+            port = getattr(
+                args, "port", 5000
+            )  # Default to 5000 if args.port is not available
+            own_address = f"http://{self.ip_address}:{port}"
+            if peer_address not in self.peers and peer_address != own_address:
+                self.peers.add(peer_address)
+                print(f"Added peer: {peer_address}")
+                return True
+            return False
+        except Exception as e:
+            print(f"Error adding peer {peer_address}: {e}")
+            return False
 
     def register_validator(self, validator_id, public_key):
         """Registers a validator node with its public key"""
@@ -240,7 +260,15 @@ class BlockchainNode:
         """Broadcasts a transaction to all peers"""
         for peer in self.peers:
             try:
-                requests.post(f"{peer}/transactions/new", json=transaction)
+                requests.post(
+                    f"{peer}/transactions/new",
+                    json=transaction,
+                    timeout=5,  # Add 5 second timeout
+                )
+            except requests.exceptions.Timeout:
+                print(f"Timeout broadcasting to {peer}")
+            except requests.exceptions.ConnectionError:
+                print(f"Connection error broadcasting to {peer}")
             except requests.exceptions.RequestException as e:
                 print(f"Error broadcasting to {peer}: {e}")
 
@@ -932,14 +960,15 @@ def get_transaction(transaction_id):
 
 # Consensus mechanism - run periodically
 def consensus_task():
-    while True:
+    while not shutdown_flag.is_set():
         blockchain_node.consensus()
         time.sleep(10)  # Run consensus every 10 seconds
+    print("Consensus thread stopped")
 
 
 # Validator mining - run periodically
 def mining_task():
-    while True:
+    while not shutdown_flag.is_set():
         if blockchain_node.is_validator and blockchain_node.pending_transactions:
             # Check if it's this node's turn to validate
             current_validator = blockchain_node.get_next_validator()
@@ -979,6 +1008,7 @@ def mining_task():
                 )
 
         time.sleep(5)  # Check for pending transactions every 5 seconds
+    print("Mining thread stopped")
 
 
 if __name__ == "__main__":
@@ -995,6 +1025,10 @@ if __name__ == "__main__":
     # Generate a node ID if not provided
     node_id = args.id if args.id else f"node_{args.port}"
 
+    # Register signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
     # Create the blockchain node
     blockchain_node = BlockchainNode(node_id=node_id, is_validator=args.validator)
 
@@ -1008,5 +1042,12 @@ if __name__ == "__main__":
         mining_thread.daemon = True
         mining_thread.start()
 
-    # Run the Flask app
-    app.run(host="0.0.0.0", port=args.port)
+    # Run the Flask app with proper shutdown handling
+    try:
+        app.run(host="0.0.0.0", port=args.port)
+    except KeyboardInterrupt:
+        print("\nReceived keyboard interrupt")
+        shutdown_flag.set()
+        # Give threads time to cleanup
+        time.sleep(2)
+        sys.exit(0)
