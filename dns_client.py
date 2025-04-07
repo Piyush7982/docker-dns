@@ -1586,13 +1586,23 @@ class DNSClientShell(cmd.Cmd):
         if self.verbose:
             print(f"DEBUG: {message}")
 
-    # Hide specified commands from help
     def get_names(self):
+        """Hide specified commands from help menu"""
         names = super().get_names()
         return [
             n
             for n in names
-            if n not in ["do_update", "do_list_nodes", "do_verbose", "do_my_domains"]
+            if n
+            not in [
+                "do_update",
+                "do_list_nodes",
+                "do_verbose",
+                "do_my_domains",
+                "do_list_records",
+                "do_transfer",
+                "do_connect",
+                "do_disconnect",
+            ]
         ]
 
     def _update_domain(self, domain_name, ip_address):

@@ -109,6 +109,80 @@ done
 # Make sure connect_peers.sh is executable
 chmod +x connect_peers.sh
 
+# Function to wait for blockchain/validator nodes before starting
+wait_for_network() {
+    # Define blockchain and validator node IPs
+    BLOCKCHAIN_IPS=("192.168.1.10" "192.168.1.11" "192.168.1.12")
+    VALIDATOR_IPS=("192.168.1.20" "192.168.1.21")
+    
+    # If starting a validator, wait for blockchain nodes
+    if [ "$NODE_TYPE" = "validator" ]; then
+        echo "Waiting for blockchain nodes to be available..."
+        MAX_RETRIES=30
+        RETRY_DELAY=5
+        
+        for BLOCKCHAIN_IP in "${BLOCKCHAIN_IPS[@]}"; do
+            RETRIES=0
+            echo "Checking for blockchain node at $BLOCKCHAIN_IP:$PORT..."
+            
+            while [ $RETRIES -lt $MAX_RETRIES ]; do
+                if curl -s -m 2 "http://$BLOCKCHAIN_IP:$PORT/node/status" >/dev/null 2>&1; then
+                    echo "✓ Blockchain node at $BLOCKCHAIN_IP:$PORT is available"
+                    break
+                fi
+                
+                RETRIES=$((RETRIES + 1))
+                if [ $RETRIES -lt $MAX_RETRIES ]; then
+                    echo "Waiting for blockchain node at $BLOCKCHAIN_IP:$PORT (attempt $RETRIES/$MAX_RETRIES)..."
+                    sleep $RETRY_DELAY
+                else
+                    echo "⚠️ Could not connect to blockchain node at $BLOCKCHAIN_IP:$PORT after $MAX_RETRIES attempts"
+                fi
+            done
+        done
+    fi
+    
+    # If starting a client, wait for any blockchain or validator nodes
+    if [ "$NODE_TYPE" = "client" ]; then
+        echo "Waiting for network nodes to be available..."
+        MAX_RETRIES=30
+        RETRY_DELAY=5
+        NODE_FOUND=false
+        
+        ALL_IPS=("${BLOCKCHAIN_IPS[@]}" "${VALIDATOR_IPS[@]}")
+        
+        for NODE_IP in "${ALL_IPS[@]}"; do
+            RETRIES=0
+            echo "Checking for node at $NODE_IP:$PORT..."
+            
+            while [ $RETRIES -lt $MAX_RETRIES ]; do
+                if curl -s -m 2 "http://$NODE_IP:$PORT/node/status" >/dev/null 2>&1; then
+                    echo "✓ Node at $NODE_IP:$PORT is available"
+                    NODE_FOUND=true
+                    break
+                fi
+                
+                RETRIES=$((RETRIES + 1))
+                if [ $RETRIES -lt $MAX_RETRIES ]; then
+                    echo "Waiting for node at $NODE_IP:$PORT (attempt $RETRIES/$MAX_RETRIES)..."
+                    sleep $RETRY_DELAY
+                else
+                    echo "⚠️ Could not connect to node at $NODE_IP:$PORT after $MAX_RETRIES attempts"
+                fi
+            done
+            
+            # If at least one node is found, we can continue
+            if [ "$NODE_FOUND" = true ]; then
+                break
+            fi
+        done
+        
+        if [ "$NODE_FOUND" = false ]; then
+            echo "⚠️ Could not find any active nodes in the network. Starting in standalone mode."
+        fi
+    fi
+}
+
 # Start the node based on its type
 case $NODE_TYPE in
     blockchain)
@@ -126,15 +200,14 @@ case $NODE_TYPE in
         # Wait for node to initialize
         sleep 5
         
-        # Connect to peers
-        echo "Connecting to peers..."
-        ./connect_peers.sh
-        
-        # Wait for the node process
-        echo "Node is running. Press Ctrl+C to stop."
+        # Connect to peers - let the background network discovery thread handle this
+        echo "Node is running in auto-discovery mode. Press Ctrl+C to stop."
         wait $NODE_PID
         ;;
     validator)
+        # Wait for blockchain nodes before starting validator
+        wait_for_network
+        
         python3 blockchain_node.py --id $NODE_ID --port $PORT --validator &
         NODE_PID=$!
         echo "Validator node started with PID: $NODE_PID"
@@ -149,15 +222,13 @@ case $NODE_TYPE in
         # Wait for node to initialize
         sleep 5
         
-        # Connect to peers
-        echo "Connecting to peers..."
-        ./connect_peers.sh
-        
-        # Wait for the node process
-        echo "Node is running. Press Ctrl+C to stop."
+        echo "Node is running in auto-discovery mode. Press Ctrl+C to stop."
         wait $NODE_PID
         ;;
     client)
+        # Wait for blockchain/validator nodes before starting client
+        wait_for_network
+    
         # For client, determine which nodes to connect to based on current network
         BLOCKCHAIN_NODES=""
         for NODE_IP in "192.168.1.10" "192.168.1.11" "192.168.1.12" "192.168.1.20" "192.168.1.21"; do

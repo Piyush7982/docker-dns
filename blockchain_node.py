@@ -17,11 +17,15 @@ import requests
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 import signal
+import random
 
 app = Flask(__name__)
 
 # Add global flag for shutdown
 shutdown_flag = threading.Event()
+
+# Add periodic reconnection timer
+RECONNECT_INTERVAL = 10  # seconds
 
 
 # Add signal handler
@@ -510,17 +514,45 @@ class BlockchainNode:
         consensus_attempts = 0
         max_attempts = 3
 
+        print(f"Starting consensus - current chain length: {max_length}")
+
         while consensus_attempts < max_attempts:
             consensus_attempts += 1
             print(f"Consensus attempt {consensus_attempts}/{max_attempts}")
+            found_valid_chain = False
 
-            # Check chains from all peers
-            for peer in self.peers:
+            # Check chains from all peers in random order
+            peers = list(self.peers)
+            random.shuffle(peers)
+
+            for peer in peers:
                 try:
+                    # First check peer's status
+                    status_response = requests.get(f"{peer}/node/status", timeout=5)
+                    if status_response.status_code != 200:
+                        continue
+
+                    peer_status = status_response.json()
+                    peer_chain_length = peer_status.get("chain_length", 0)
+
+                    # Only fetch chain if peer has more blocks
+                    if peer_chain_length <= max_length:
+                        continue
+
+                    print(
+                        f"Found peer with longer chain: {peer} (length: {peer_chain_length})"
+                    )
+
+                    # Get the peer's chain
                     response = requests.get(f"{peer}/chain", timeout=10)
                     if response.status_code == 200:
                         chain = response.json().get("chain")
                         length = len(chain)
+
+                        # Verify chain length matches reported length
+                        if length != peer_chain_length:
+                            print(f"Chain length mismatch from peer {peer}")
+                            continue
 
                         # Check if the chain is longer and valid
                         if length > max_length and self.validate_chain(chain):
@@ -534,18 +566,36 @@ class BlockchainNode:
                                         != chain[i - 1]["hash"]
                                     ):
                                         chain_valid = False
+                                        print(f"Chain validation failed at block {i}")
                                         break
 
                                 if chain_valid:
-                                    max_length = length
-                                    longest_chain = chain
-                                    print(f"Found valid longer chain from peer {peer}")
+                                    # Check if we share a common history
+                                    common_history = False
+                                    for i in range(min(len(self.chain), len(chain))):
+                                        if self.chain[i]["hash"] == chain[i]["hash"]:
+                                            common_history = True
+                                        else:
+                                            if i == 0:  # Different genesis blocks
+                                                common_history = False
+                                            break
+
+                                    if common_history:
+                                        max_length = length
+                                        longest_chain = chain
+                                        found_valid_chain = True
+                                        print(
+                                            f"Found valid longer chain from peer {peer}"
+                                        )
+                                        break
+                                    else:
+                                        print(f"No common history with peer {peer}")
                 except requests.exceptions.RequestException as e:
                     print(f"Failed to fetch chain from peer {peer}: {e}")
                     continue
 
             # Replace our chain if a longer valid chain is found
-            if longest_chain:
+            if longest_chain and found_valid_chain:
                 print(f"Replacing chain with longer valid chain of length {max_length}")
                 self.chain = longest_chain
                 self.rebuild_dns_records()
@@ -554,7 +604,7 @@ class BlockchainNode:
                 return True
 
             # If no valid longer chain found, wait briefly before next attempt
-            if consensus_attempts < max_attempts:
+            if consensus_attempts < max_attempts and not found_valid_chain:
                 time.sleep(2)
 
         print("Consensus failed: no valid longer chain found")
@@ -563,10 +613,12 @@ class BlockchainNode:
     def validate_chain(self, chain):
         """Validates a blockchain"""
         if not chain:
+            print("Empty chain")
             return False
 
         # Check genesis block
         if chain[0]["index"] != 0 or chain[0]["previous_hash"] != "0":
+            print("Invalid genesis block")
             return False
 
         # Check each block in the chain
@@ -576,14 +628,17 @@ class BlockchainNode:
 
             # Check block index
             if current_block["index"] != i:
+                print(f"Invalid block index at position {i}")
                 return False
 
             # Check previous hash
             if current_block["previous_hash"] != previous_block["hash"]:
+                print(f"Invalid previous hash at block {i}")
                 return False
 
             # Check block hash
             if self.hash_block(current_block) != current_block["hash"]:
+                print(f"Invalid block hash at block {i}")
                 return False
 
             # Skip signature verification for genesis block
@@ -599,10 +654,18 @@ class BlockchainNode:
                 },
                 sort_keys=True,
             )
-            if not self.verify_signature(
-                block_string, current_block["signature"], current_block["validator"]
-            ):
-                return False
+
+            # Only verify if we have the validator's public key
+            if current_block["validator"] in self.validators:
+                if not self.verify_signature(
+                    block_string, current_block["signature"], current_block["validator"]
+                ):
+                    print(f"Invalid signature at block {i}")
+                    return False
+            else:
+                print(
+                    f"Warning: Cannot verify signature for validator {current_block['validator']} at block {i}"
+                )
 
         return True
 
@@ -1103,6 +1166,128 @@ def mining_task():
     print("Mining thread stopped")
 
 
+# Periodic network discovery and reconnection task
+def network_discovery_task():
+    """Periodically discover and connect to new nodes in the network"""
+    # Predefined IP ranges for blockchain and validator nodes
+    blockchain_ips = ["192.168.1.10", "192.168.1.11", "192.168.1.12"]
+    validator_ips = ["192.168.1.20", "192.168.1.21"]
+    all_ips = blockchain_ips + validator_ips
+    port = getattr(args, "port", 5000)
+
+    while not shutdown_flag.is_set():
+        print(
+            f"Performing network discovery... (current peers: {len(blockchain_node.peers)})"
+        )
+
+        # Get current node's IP and URL
+        current_ip = blockchain_node.ip_address
+        current_url = f"http://{current_ip}:{port}"
+
+        # Count connection successes and failures
+        successful_connections = 0
+        failed_connections = 0
+
+        for ip in all_ips:
+            if ip == current_ip:  # Skip self
+                continue
+
+            target_url = f"http://{ip}:{port}"
+            if target_url in blockchain_node.peers:
+                # Already connected - check if node is still alive
+                try:
+                    response = requests.get(f"{target_url}/node/status", timeout=3)
+                    if response.status_code == 200:
+                        successful_connections += 1
+                        print(f"Peer {target_url} is alive")
+                    else:
+                        # Node not responding properly - remove and try to reconnect
+                        blockchain_node.peers.remove(target_url)
+                        print(f"Peer {target_url} not responding - removed from peers")
+                except requests.exceptions.RequestException:
+                    # Node not responding - remove from peers
+                    blockchain_node.peers.remove(target_url)
+                    print(f"Peer {target_url} not responding - removed from peers")
+            else:
+                # Not already connected - try to connect
+                try:
+                    # First check if the node is responsive
+                    status_response = requests.get(
+                        f"{target_url}/node/status", timeout=3
+                    )
+
+                    if status_response.status_code == 200:
+                        # Register self with peer
+                        register_response = requests.post(
+                            f"{target_url}/peers/register",
+                            json={"peer": current_url},
+                            timeout=3,
+                        )
+
+                        # Add peer to our peer list
+                        if blockchain_node.add_peer(target_url):
+                            successful_connections += 1
+                            print(f"Successfully connected to peer {target_url}")
+
+                            # If we're a validator, register with the node
+                            if blockchain_node.is_validator:
+                                try:
+                                    # Read our public key
+                                    with open(
+                                        os.path.join(
+                                            blockchain_node.keys_dir,
+                                            f"{blockchain_node.node_id}.pub",
+                                        ),
+                                        "rb",
+                                    ) as f:
+                                        public_key = f.read().decode("utf-8")
+
+                                    # Register as validator with the node
+                                    register_validator_response = requests.post(
+                                        f"{target_url}/validators/register",
+                                        json={
+                                            "validator_id": blockchain_node.node_id,
+                                            "public_key": public_key,
+                                        },
+                                        timeout=3,
+                                    )
+
+                                    if register_validator_response.status_code in (
+                                        200,
+                                        201,
+                                    ):
+                                        print(
+                                            f"Successfully registered as validator with {target_url}"
+                                        )
+                                    else:
+                                        print(
+                                            f"Failed to register as validator with {target_url}"
+                                        )
+
+                                except Exception as e:
+                                    print(
+                                        f"Error registering validator with {target_url}: {e}"
+                                    )
+                        else:
+                            print(f"Peer {target_url} already added")
+                    else:
+                        failed_connections += 1
+                        print(f"Node at {target_url} not responsive")
+
+                except requests.exceptions.RequestException:
+                    failed_connections += 1
+                    print(f"Failed to connect to {target_url}")
+
+        print(
+            f"Network discovery completed: {successful_connections} successful connection(s), {failed_connections} failed connection(s)"
+        )
+
+        # Sleep until next discovery cycle
+        time.sleep(RECONNECT_INTERVAL)
+
+    print("Network discovery thread stopped")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Blockchain Node")
     parser.add_argument(
@@ -1124,7 +1309,7 @@ if __name__ == "__main__":
     # Create the blockchain node
     blockchain_node = BlockchainNode(node_id=node_id, is_validator=args.validator)
 
-    # Start consensus and mining threads
+    # Start consensus, mining, and network discovery threads
     consensus_thread = threading.Thread(target=consensus_task)
     consensus_thread.daemon = True
     consensus_thread.start()
@@ -1133,6 +1318,11 @@ if __name__ == "__main__":
         mining_thread = threading.Thread(target=mining_task)
         mining_thread.daemon = True
         mining_thread.start()
+
+    # Start network discovery thread
+    discovery_thread = threading.Thread(target=network_discovery_task)
+    discovery_thread.daemon = True
+    discovery_thread.start()
 
     # Run the Flask app with proper shutdown handling
     try:
